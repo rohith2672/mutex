@@ -7,171 +7,215 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <netdb.h>  // For hostname resolution
 #include "distributed_mutex.h"
+#include "msg_packet.h"
 
-#define MAX_PROCESSES 10
 #define MAX_MSG_LEN 256
 
-typedef struct {
-    int id;
-    int timestamp[MAX_PROCESSES];
-} Request;
+/* Global variables */
+static int local_id, total_procs;
+static char **host_list;
+static int *port_list;
+static int sock_fd;
+static sem_t sem_reply;
+static int *acct_ptr;
+static unsigned short sequence_num = 0;
+static unsigned short vec_clock[5] = {0};
 
-int my_id, num_procs;
-char **all_hostnames;
-int *all_ports;
-int vector_clock[MAX_PROCESSES];
-int socket_fd;
-sem_t mutex_sem;
-int *shared_balance;
+/* Function prototypes */
+static void *listener_thread(void *arg);
+static void send_request();
+static void send_reply(int dest);
+static void send_balance_update();
+static void handle_request(const msg_packet *msg);
+static void handle_reply(const msg_packet *msg);
 
-void *listener_thread(void *arg);
-void send_request();
-void send_reply(int to);
-void send_balance_update();
-void handle_request(int from);
-void handle_reply(int from);
+/* Initialize the distributed mutex module and spawn listener thread */
+int dm_init(int l_id, int tot_procs, char **hosts, int *ports, int *balance_ptr) {
+    local_id = l_id;
+    total_procs = tot_procs;
+    host_list = hosts;
+    port_list = ports;
+    acct_ptr = balance_ptr;
 
-int distributed_mutex_init(int id, int nprocs, char **hostnames, int *ports, int *balance_ptr) {
-    my_id = id;
-    num_procs = nprocs;
-    all_hostnames = hostnames;
-    all_ports = ports;
-    shared_balance = balance_ptr;
-
-    sem_init(&mutex_sem, 0, 0);
-    memset(vector_clock, 0, sizeof(vector_clock));
+    sem_init(&sem_reply, 0, 0);
+    memset(vec_clock, 0, sizeof(vec_clock));
 
     struct sockaddr_in addr;
-    socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (socket_fd < 0) {
+    sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_fd < 0) {
         perror("socket");
         return -1;
     }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(all_ports[my_id]);
+    addr.sin_port = htons(port_list[local_id]);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
         return -1;
     }
 
-    pthread_t t;
-    pthread_create(&t, NULL, listener_thread, NULL);
-
-    printf("[P%d] Listener started.\n", my_id);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, listener_thread, NULL)) {
+        perror("pthread_create");
+        return -1;
+    }
+    printf("[P%d] Listener started.\n", local_id);
+    fflush(stdout);
     return 0;
 }
 
-void distributed_mutex_lock() {
-    printf("[P%d] Sending REQUESTs...\n", my_id);
+void dm_lock() {
+    printf("[P%d] Sending REQUEST messages...\n", local_id);
+    fflush(stdout);
     send_request();
 
-    for (int i = 0; i < num_procs - 1; i++) {
-        sem_wait(&mutex_sem);
+    for (int i = 0; i < total_procs - 1; i++) {
+        sem_wait(&sem_reply);
     }
+    printf("[P%d] Acquired lock.\n", local_id);
+    fflush(stdout);
+}
 
-    printf("[P%d] Acquired lock.\n", my_id);
+void dm_unlock() {
+    printf("[P%d] Releasing lock.\n", local_id);
+    fflush(stdout);
+}
 
-    // Update balance
-    printf("[P%d] Old Balance: %d\n", my_id, *shared_balance);
-    *shared_balance += 100;  // Update the balance
-    printf("[P%d] New Balance: %d\n", my_id, *shared_balance);
-
-    // Broadcast the updated balance
+void dm_update_balance() {
+    printf("[P%d] Broadcasting updated account balance: %d\n", local_id, *acct_ptr);
+    fflush(stdout);
     send_balance_update();
 }
 
-void distributed_mutex_unlock() {
-    printf("[P%d] Releasing lock.\n", my_id);
-}
-
-void *listener_thread(void *arg) {
-    char buffer[MAX_MSG_LEN];
+/* Listener thread: continuously receives messages */
+static void *listener_thread(void *arg) {
+    (void)arg;
+    msg_packet msg;
     struct sockaddr_in src_addr;
     socklen_t addrlen = sizeof(src_addr);
 
     while (1) {
-        ssize_t len = recvfrom(socket_fd, buffer, MAX_MSG_LEN, 0, (struct sockaddr *)&src_addr, &addrlen);
+        ssize_t len = recvfrom(sock_fd, &msg, sizeof(msg_packet), 0,
+                                (struct sockaddr *)&src_addr, &addrlen);
         if (len > 0) {
-            buffer[len] = '\0';
-
-            if (strncmp(buffer, "REQUEST", 7) == 0) {
-                int from;
-                sscanf(buffer + 8, "%d", &from);
-                handle_request(from);
-            } else if (strncmp(buffer, "REPLY", 5) == 0) {
-                int from;
-                sscanf(buffer + 6, "%d", &from);
-                handle_reply(from);
-            } else if (strncmp(buffer, "BALANCE", 7) == 0) {
-                int new_balance;
-                sscanf(buffer + 8, "%d", &new_balance);
-                *shared_balance = new_balance; // Update local balance
-
-                // Get the sender's IP address or other identifier
-                int from = src_addr.sin_port;  // Or extract a more meaningful identifier here if needed.
-
-                printf("[P%d] Updated Balance from P%d: %d\n", my_id, from, *shared_balance);
+            switch (msg.command) {
+                case CMD_REQUEST:
+                    handle_request(&msg);
+                    break;
+                case CMD_REPLY:
+                    handle_reply(&msg);
+                    break;
+                case CMD_HELLO:
+                    /* Optional: handle HELLO messages */
+                    break;
+                case CMD_IN_CS:
+                    printf("[P%d] Received IN_CS from P%d: updating account balance to %u\n",
+                           local_id, msg.host_id, msg.acct_balance);
+                    fflush(stdout);
+                    *acct_ptr = msg.acct_balance;
+                    break;
+                default:
+                    break;
             }
         }
     }
     return NULL;
 }
 
-void send_request() {
-    char msg[MAX_MSG_LEN];
-    sprintf(msg, "REQUEST %d", my_id);
+/* Helper function: resolve a hostname to fill in destination address */
+static int fill_addr_from_hostname(const char *hostname, struct sockaddr_in *addr) {
+    struct hostent *he = gethostbyname(hostname);
+    if (he == NULL) {
+        herror("gethostbyname");
+        return -1;
+    }
+    memcpy(&addr->sin_addr, he->h_addr_list[0], he->h_length);
+    return 0;
+}
 
-    for (int i = 0; i < num_procs; i++) {
-        if (i == my_id) continue;
+/* Sends a REQUEST message to all other processes */
+static void send_request() {
+    msg_packet msg;
+    msg.command = CMD_REQUEST;
+    msg.sequence = sequence_num++;
+    msg.tie_break = (unsigned int)getpid();
+    msg.host_id = local_id;
+    memcpy(msg.vec_clock, vec_clock, sizeof(vec_clock));
+    msg.acct_balance = 0;  /* Not used for REQUEST */
 
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(all_ports[i]);
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-        sendto(socket_fd, msg, strlen(msg), 0, (struct sockaddr *)&addr, sizeof(addr));
+    for (int i = 0; i < total_procs; i++) {
+        if (i == local_id)
+            continue;
+        struct sockaddr_in dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(port_list[i]);
+        if (fill_addr_from_hostname(host_list[i], &dest_addr) < 0)
+            continue;
+        sendto(sock_fd, &msg, sizeof(msg_packet), 0,
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     }
 }
 
-void send_reply(int to) {
-    char msg[MAX_MSG_LEN];
-    sprintf(msg, "REPLY %d", my_id);
+/* Sends a REPLY message to a specific process */
+static void send_reply(int dest) {
+    msg_packet msg;
+    msg.command = CMD_REPLY;
+    msg.sequence = sequence_num++;
+    msg.tie_break = (unsigned int)getpid();
+    msg.host_id = local_id;
+    memcpy(msg.vec_clock, vec_clock, sizeof(vec_clock));
+    msg.acct_balance = 0;  /* Not used for REPLY */
 
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(all_ports[to]);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-    sendto(socket_fd, msg, strlen(msg), 0, (struct sockaddr *)&addr, sizeof(addr));
+    struct sockaddr_in dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(port_list[dest]);
+    if (fill_addr_from_hostname(host_list[dest], &dest_addr) < 0)
+        return;
+    sendto(sock_fd, &msg, sizeof(msg_packet), 0,
+           (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 }
 
-void send_balance_update() {
-    char msg[MAX_MSG_LEN];
-    sprintf(msg, "BALANCE %d", *shared_balance);
+/* Broadcasts the updated balance via an IN_CS message */
+static void send_balance_update() {
+    msg_packet msg;
+    msg.command = CMD_IN_CS;
+    msg.sequence = sequence_num++;
+    msg.tie_break = (unsigned int)getpid();
+    msg.host_id = local_id;
+    memcpy(msg.vec_clock, vec_clock, sizeof(vec_clock));
+    msg.acct_balance = *acct_ptr;
 
-    for (int i = 0; i < num_procs; i++) {
-        if (i == my_id) continue;
-
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(all_ports[i]);
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-        sendto(socket_fd, msg, strlen(msg), 0, (struct sockaddr *)&addr, sizeof(addr));
+    for (int i = 0; i < total_procs; i++) {
+        if (i == local_id)
+            continue;
+        struct sockaddr_in dest_addr;
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(port_list[i]);
+        if (fill_addr_from_hostname(host_list[i], &dest_addr) < 0)
+            continue;
+        sendto(sock_fd, &msg, sizeof(msg_packet), 0,
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     }
 }
 
-void handle_request(int from) {
-    printf("[P%d] Received REQUEST from P%d\n", my_id, from);
-    send_reply(from);
+/* Handle an incoming REQUEST by immediately sending a REPLY */
+static void handle_request(const msg_packet *msg) {
+    printf("[P%d] Received REQUEST from P%d\n", local_id, msg->host_id);
+    fflush(stdout);
+    send_reply(msg->host_id);
 }
 
-void handle_reply(int from) {
-    printf("[P%d] Received REPLY from P%d\n", my_id, from);
-    sem_post(&mutex_sem);
+/* Handle an incoming REPLY by posting to the semaphore */
+static void handle_reply(const msg_packet *msg) {
+    printf("[P%d] Received REPLY from P%d\n", local_id, msg->host_id);
+    fflush(stdout);
+    sem_post(&sem_reply);
 }
