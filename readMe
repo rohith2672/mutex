@@ -1,18 +1,13 @@
-Compilation instructions : 
+Instructions: 
 
-$ gcc bank_app.c distributed_mutex.c -o bank -lpthread
+Ensure that your process.hosts file contains one line per process using the format:
+  <hostid> <hostname> <port>
+For example:
+  0 192.168.1.10 5000
+  1 192.168.1.11 5001
+  2 192.168.1.12 5002
 
+Compile with a command such as:
+  gcc -pthread bank_app.c distributed_mutex.c -o bank_app
 
-
-
-After compiling , run the program on 4 seperate terminals using the below commands  : 
-
-Terminal 1:  ./bank 0
-Terminal 2 : ./bank 1
-Terminal 3: ./bank 2
-Terminal 4: ./bank 3 
-
-Start the application on all Terminals 
-
-
-
+Run one instance per host with the correct process ID and desired operation mode.
